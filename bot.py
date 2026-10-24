@@ -65,6 +65,32 @@ class Track:
     thumbnail: str | None = None  # image URL for the "now playing" embed
 
 
+# YouTube ke audio stream URLs aksar User-Agent ke bina 403 dete hain.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+
+def _pick_audio_url(info: dict) -> str | None:
+    """Get a direct audio URL out of a yt-dlp info dict.
+
+    yt-dlp frequently leaves the top-level 'url' empty and instead puts the
+    real stream links inside 'requested_formats' / 'formats', so fall back to
+    those (prefer an audio-only format).
+    """
+    if info.get("url"):
+        return info["url"]
+    formats = info.get("requested_formats") or info.get("formats") or []
+    for fmt in reversed(formats):
+        if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+            return fmt["url"]
+    for fmt in formats:
+        if fmt.get("url"):
+            return fmt["url"]
+    return None
+
+
 def _fetch_stream_url(url: str) -> str | None:
     """Resolve a YouTube watch URL to a direct audio stream URL (blocking, off-thread)."""
     try:
@@ -72,7 +98,7 @@ def _fetch_stream_url(url: str) -> str | None:
             info = ydl.extract_info(url, download=False)
         if "entries" in info:
             info = info["entries"][0]
-        return info.get("url")
+        return _pick_audio_url(info)
     except Exception as err:  # noqa: BLE001
         log.warning("Could not resolve stream for %s: %s", url, err)
         return None
@@ -134,7 +160,10 @@ class Player:
             log.warning("Could not post now-playing message: %s", err)
 
     def _play(self, track: Track, start_offset: float = 0.0) -> None:
-        before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        before = (
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            f'-user_agent "{USER_AGENT}"'
+        )
         if start_offset and start_offset > 0:
             before += f" -ss {int(start_offset)}"
         source = discord.FFmpegPCMAudio(
@@ -351,10 +380,12 @@ async def resolve_track(query: str, requester: discord.Member) -> Track:
     info = await asyncio.to_thread(_extract)
     if "entries" in info:
         info = info["entries"][0]
+    # Leave stream_url=None on purpose: the worker re-resolves a fresh (un-expired)
+    # audio URL right before playback, which is what fixes the "no sound" on queued tracks.
     return Track(
         title=info.get("title", "Unknown"),
         url=info.get("webpage_url") or info.get("url"),
-        stream_url=info.get("url"),
+        stream_url=None,
         duration=info.get("duration", 0),
         requester=requester,
         thumbnail=_best_thumbnail(info),
@@ -479,7 +510,9 @@ async def ensure_voice(inter: discord.Interaction) -> discord.VoiceClient | None
     member = inter.user
     voice_state = getattr(member, "voice", None)
     if voice_state is None or voice_state.channel is None:
-        await inter.response.send_message(
+        # play() already deferred this interaction, so we must reply via followup,
+        # not inter.response.send_message (that raises "unknown interaction").
+        await inter.followup.send(
             "❌ Pehle ek voice channel join karo, phir ye command chalao.", ephemeral=True
         )
         return None

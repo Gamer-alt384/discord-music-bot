@@ -11,3 +11,7 @@ wheels/
 
 # Secrets — never commit your bot token
 .env
+
+# Local noise — run logs and stray scaffolding
+*.out
+src/
